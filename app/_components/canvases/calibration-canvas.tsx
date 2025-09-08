@@ -27,6 +27,7 @@ import {
   pointsToGridPoints,
   gridPointsToPoints,
   getAllGridPoints,
+  updateInnerPointsPreservingAdjustments,
 } from "@/_lib/enhanced-calibration-utils";
 
 const maxPoints = 4; // One point per vertex in rectangle
@@ -72,13 +73,37 @@ export default function CalibrationCanvas({
   const [selectedInnerPointId, setSelectedInnerPointId] = useState<
     string | null
   >(null);
+  const [manuallyAdjustedIds, setManuallyAdjustedIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [previousCorners, setPreviousCorners] = useState<GridPoint[]>([]);
 
   // Generate inner points when corners or grid density changes
   useEffect(() => {
     if (points.length === maxPoints) {
       const gridCorners = pointsToGridPoints(points);
-      const newInnerPoints = generateInnerPoints(gridCorners, gridDensity);
-      setInnerPoints(newInnerPoints);
+
+      // Check if corners have changed (and we have previous corners)
+      if (previousCorners.length === 4 && innerPoints.length > 0) {
+        // Preserve manual adjustments when corners change
+        const newInnerPoints = updateInnerPointsPreservingAdjustments(
+          previousCorners,
+          gridCorners,
+          innerPoints,
+          manuallyAdjustedIds,
+          gridDensity,
+        );
+        setInnerPoints(newInnerPoints);
+      } else {
+        // Initial generation or grid density changed - regenerate all points
+        const newInnerPoints = generateInnerPoints(gridCorners, gridDensity);
+        setInnerPoints(newInnerPoints);
+        // Clear manually adjusted IDs when grid density changes
+        setManuallyAdjustedIds(new Set());
+      }
+
+      // Update previous corners for next comparison
+      setPreviousCorners(gridCorners);
     }
   }, [points, gridDensity]);
 
@@ -300,6 +325,9 @@ export default function CalibrationCanvas({
       );
       setInnerPoints(newInnerPoints);
       setDragPoint(p);
+
+      // Mark this point as manually adjusted
+      setManuallyAdjustedIds((prev) => new Set(prev).add(selectedInnerPointId));
     } else if (corners.size) {
       // Existing corner dragging logic - regenerate inner points when corners move
       const newPoints = [...points];
@@ -323,10 +351,7 @@ export default function CalibrationCanvas({
       setDragPoint(p);
       dispatch({ type: "set", points: newPoints });
 
-      // Regenerate inner points when corners change
-      const gridCorners = pointsToGridPoints(newPoints);
-      const newInnerPoints = generateInnerPoints(gridCorners, gridDensity);
-      setInnerPoints(newInnerPoints);
+      // Inner points will be updated by useEffect with preservation logic
     }
   }
 
@@ -382,6 +407,7 @@ export {
   pointsToGridPoints,
   gridPointsToPoints,
   getAllGridPoints,
+  updateInnerPointsPreservingAdjustments,
 } from "@/_lib/enhanced-calibration-utils";
 
 function hasTopEdge(corners: Set<number>): boolean {
@@ -503,6 +529,17 @@ function drawEnhancedGrid(
   gridDensity: { rows: number; cols: number },
   displaySettings: DisplaySettings,
 ) {
+  // Safety check: ensure we have valid data before drawing
+  if (
+    !corners ||
+    corners.length !== 4 ||
+    !gridDensity ||
+    gridDensity.rows < 2 ||
+    gridDensity.cols < 2
+  ) {
+    return; // Skip drawing if invalid data
+  }
+
   const allGridPoints = getAllGridPoints(corners, innerPoints, gridDensity);
 
   ctx.strokeStyle = strokeColor(displaySettings.theme);
@@ -600,7 +637,7 @@ function drawCalibration(
     ctx.stroke();
 
     // Draw enhanced grid with proper intersections
-    if (innerPoints && gridDensity) {
+    if (innerPoints && gridDensity && points && points.length === 4) {
       const gridCorners = pointsToGridPoints(points);
       drawEnhancedGrid(
         ctx,
