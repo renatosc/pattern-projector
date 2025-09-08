@@ -21,6 +21,13 @@ import { PointAction } from "@/_reducers/pointsReducer";
 import { FullScreenHandle } from "react-full-screen";
 import Matrix from "ml-matrix";
 import { getCalibrationContextUpdatedWithEvent } from "@/_lib/calibration-context";
+import { GridPoint } from "@/_lib/enhanced-calibration-types";
+import {
+  generateInnerPoints,
+  pointsToGridPoints,
+  gridPointsToPoints,
+  getAllGridPoints,
+} from "@/_lib/enhanced-calibration-utils";
 
 const maxPoints = 4; // One point per vertex in rectangle
 const cornerMargin = 96;
@@ -37,6 +44,7 @@ export default function CalibrationCanvas({
   corners,
   setCorners,
   fullScreenHandle,
+  onGridDensityChange,
 }: {
   className: string | undefined;
   points: Point[];
@@ -49,10 +57,37 @@ export default function CalibrationCanvas({
   corners: Set<number>;
   setCorners: Dispatch<SetStateAction<Set<number>>>;
   fullScreenHandle: FullScreenHandle;
+  onGridDensityChange?: (density: { rows: number; cols: number }) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [hoverCorners, setHoverCorners] = useState<Set<number>>(new Set());
   const [dragPoint, setDragPoint] = useState<Point | null>(null);
+  const [hoveredInnerPointId, setHoveredInnerPointId] = useState<string | null>(
+    null,
+  );
+
+  // Enhanced calibration state
+  const [gridDensity, setGridDensity] = useState({ rows: 8, cols: 8 });
+  const [innerPoints, setInnerPoints] = useState<GridPoint[][]>([]);
+  const [selectedInnerPointId, setSelectedInnerPointId] = useState<
+    string | null
+  >(null);
+
+  // Generate inner points when corners or grid density changes
+  useEffect(() => {
+    if (points.length === maxPoints) {
+      const gridCorners = pointsToGridPoints(points);
+      const newInnerPoints = generateInnerPoints(gridCorners, gridDensity);
+      setInnerPoints(newInnerPoints);
+    }
+  }, [points, gridDensity]);
+
+  // Notify parent component of grid density changes
+  useEffect(() => {
+    if (onGridDensityChange) {
+      onGridDensityChange(gridDensity);
+    }
+  }, [gridDensity, onGridDensityChange]);
 
   useEffect(() => {
     if (
@@ -97,7 +132,14 @@ export default function CalibrationCanvas({
           null,
           null,
         );
-        draw(cs);
+        draw(
+          cs,
+          innerPoints,
+          selectedInnerPointId,
+          hoveredInnerPointId,
+          displaySettings,
+          gridDensity,
+        );
       }
     }
   }, [
@@ -109,6 +151,9 @@ export default function CalibrationCanvas({
     hoverCorners,
     unitOfMeasure,
     displaySettings,
+    innerPoints,
+    selectedInnerPointId,
+    hoveredInnerPointId,
   ]);
 
   function isNearCenter(p: Point): boolean {
@@ -124,6 +169,13 @@ export default function CalibrationCanvas({
   }
 
   function selectCorners(p: Point): Set<number> {
+    // Don't select corners if we're near an inner point
+    const innerPoint = getNearbyInnerPoint(p);
+    if (innerPoint) {
+      return new Set(); // Let inner point selection take priority
+    }
+
+    // Existing corner selection logic
     const corner = getNearbyCorner(p);
     if (corner !== -1) {
       return new Set([corner]);
@@ -136,6 +188,17 @@ export default function CalibrationCanvas({
       return new Set([0, 1, 2, 3]);
     }
     return new Set();
+  }
+
+  function getNearbyInnerPoint(p: Point): GridPoint | null {
+    for (const row of innerPoints) {
+      for (const point of row) {
+        if (sqrDist(point, p) < (cornerMargin / 2) ** 2) {
+          return point;
+        }
+      }
+    }
+    return null;
   }
 
   function getNearbyEdge(p: Point): number[] {
@@ -193,19 +256,52 @@ export default function CalibrationCanvas({
 
   function handlePointerDown(e: React.PointerEvent) {
     const p = { x: e.clientX, y: e.clientY };
+
+    // First check for inner point selection
+    const innerPoint = getNearbyInnerPoint(p);
+    if (innerPoint) {
+      setDragPoint(p);
+      setSelectedInnerPointId(innerPoint.id);
+      setCorners(new Set());
+      setHoverCorners(new Set());
+      return;
+    }
+
+    // Then check for corner/edge selection (existing logic)
     const selectedCorners = selectCorners(p);
     if (selectedCorners.size) {
       setDragPoint(p);
       setCorners(selectedCorners);
       setHoverCorners(new Set());
+      setSelectedInnerPointId(null);
     }
   }
 
   function handlePointerMove(e: React.PointerEvent) {
     const p = { x: e.clientX, y: e.clientY };
     if (dragPoint === null) {
-      setHoverCorners(selectCorners(p));
+      // Check for hover states
+      const innerPoint = getNearbyInnerPoint(p);
+      if (innerPoint) {
+        setHoveredInnerPointId(innerPoint.id);
+        setHoverCorners(new Set());
+      } else {
+        setHoveredInnerPointId(null);
+        setHoverCorners(selectCorners(p));
+      }
+    } else if (selectedInnerPointId) {
+      // Handle inner point dragging - update the specific intersection point
+      const newInnerPoints = innerPoints.map((row) =>
+        row.map((point) =>
+          point.id === selectedInnerPointId
+            ? { ...point, x: p.x, y: p.y }
+            : point,
+        ),
+      );
+      setInnerPoints(newInnerPoints);
+      setDragPoint(p);
     } else if (corners.size) {
+      // Existing corner dragging logic - regenerate inner points when corners move
       const newPoints = [...points];
       let dx = p.x - dragPoint.x;
       let dy = p.y - dragPoint.y;
@@ -226,6 +322,11 @@ export default function CalibrationCanvas({
       }
       setDragPoint(p);
       dispatch({ type: "set", points: newPoints });
+
+      // Regenerate inner points when corners change
+      const gridCorners = pointsToGridPoints(newPoints);
+      const newInnerPoints = generateInnerPoints(gridCorners, gridDensity);
+      setInnerPoints(newInnerPoints);
     }
   }
 
@@ -240,8 +341,15 @@ export default function CalibrationCanvas({
         getCalibrationContextUpdatedWithEvent(e, fullScreenHandle.active),
       ),
     );
-    dispatch({ type: "set", points });
+
+    // Only dispatch corner point changes, inner points are managed separately
+    if (!selectedInnerPointId) {
+      dispatch({ type: "set", points });
+    }
+
     setDragPoint(null);
+    setSelectedInnerPointId(null);
+    setHoveredInnerPointId(null);
   }
 
   return (
@@ -257,11 +365,24 @@ export default function CalibrationCanvas({
       onPointerMove={handlePointerMove}
       style={{
         pointerEvents: isCalibrating ? "auto" : "none",
-        cursor: dragPoint ? "none" : "grab",
+        cursor: dragPoint
+          ? "none"
+          : hoveredInnerPointId || hoverCorners.size > 0
+            ? "grab"
+            : "default",
       }}
     />
   );
 }
+
+// Export utility functions for external use
+export type { GridPoint } from "@/_lib/enhanced-calibration-types";
+export {
+  generateInnerPoints,
+  pointsToGridPoints,
+  gridPointsToPoints,
+  getAllGridPoints,
+} from "@/_lib/enhanced-calibration-utils";
 
 function hasTopEdge(corners: Set<number>): boolean {
   return corners.has(0) && corners.has(1);
@@ -279,11 +400,29 @@ function hasRightEdge(corners: Set<number>): boolean {
   return corners.has(1) && corners.has(2);
 }
 
-function draw(cs: CanvasState): void {
+function draw(
+  cs: CanvasState,
+  innerPoints?: GridPoint[][],
+  selectedInnerPointId?: string | null,
+  hoveredInnerPointId?: string | null,
+  displaySettings?: DisplaySettings,
+  gridDensity?: { rows: number; cols: number },
+): void {
   const { ctx, isCalibrating } = cs;
   if (isCalibrating) {
     ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-    drawCalibration(cs);
+    drawCalibration(cs, innerPoints, gridDensity);
+
+    // Draw inner grid points if available
+    if (innerPoints && displaySettings) {
+      drawInnerGridPoints(
+        ctx,
+        innerPoints,
+        selectedInnerPointId || null,
+        hoveredInnerPointId || null,
+        displaySettings,
+      );
+    }
   } else if (cs.isConcave) {
     ctx.fillStyle = cs.errorFillPattern;
     drawPolygon(ctx, cs.points);
@@ -293,10 +432,12 @@ function draw(cs: CanvasState): void {
 
 function drawCalibrationPoints(cs: CanvasState) {
   const { ctx, points, corners, hoverCorners, displaySettings } = cs;
+
+  // Draw corner points (existing logic)
   points.forEach((point, index) => {
     ctx.beginPath();
     const oneCorner = corners.size === 1 && corners.has(index);
-    const radius = oneCorner ? 20 : 10;
+    const radius = oneCorner ? 20 : 12;
     ctx.strokeStyle = oneCorner
       ? "rgb(147, 51, 234)"
       : strokeColor(displaySettings.theme);
@@ -311,7 +452,90 @@ function drawCalibrationPoints(cs: CanvasState) {
   });
 }
 
-function drawCalibration(cs: CanvasState): void {
+function drawInnerGridPoints(
+  ctx: CanvasRenderingContext2D,
+  innerPoints: GridPoint[][],
+  selectedId: string | null,
+  hoveredId: string | null,
+  displaySettings: DisplaySettings,
+) {
+  // Draw inner grid points
+  ctx.strokeStyle = strokeColor(displaySettings.theme);
+  ctx.lineWidth = 1;
+
+  innerPoints.forEach((row) => {
+    row.forEach((point) => {
+      ctx.beginPath();
+      const isSelected = selectedId === point.id;
+      const isHovered = hoveredId === point.id;
+      const radius = isSelected ? 8 : isHovered ? 6 : 4;
+
+      if (isSelected) {
+        ctx.fillStyle = "rgb(255, 100, 100)"; // Red for selected
+        ctx.strokeStyle = "rgb(200, 50, 50)";
+        ctx.lineWidth = 2;
+      } else if (isHovered) {
+        ctx.fillStyle = "rgba(255, 255, 100, 0.9)"; // Brighter yellow for hover
+        ctx.strokeStyle = strokeColor(displaySettings.theme);
+        ctx.lineWidth = 2;
+        ctx.setLineDash([2, 2]); // Dashed border for hover
+      } else {
+        ctx.fillStyle = "rgba(255, 255, 0, 0.8)"; // Standard yellow
+        ctx.strokeStyle = strokeColor(displaySettings.theme);
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+      }
+
+      ctx.arc(point.x, point.y, radius, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.stroke();
+
+      // Reset line dash
+      ctx.setLineDash([]);
+    });
+  });
+}
+
+function drawEnhancedGrid(
+  ctx: CanvasRenderingContext2D,
+  corners: GridPoint[],
+  innerPoints: GridPoint[][],
+  gridDensity: { rows: number; cols: number },
+  displaySettings: DisplaySettings,
+) {
+  const allGridPoints = getAllGridPoints(corners, innerPoints, gridDensity);
+
+  ctx.strokeStyle = strokeColor(displaySettings.theme);
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+
+  // Draw horizontal grid lines
+  for (let row = 0; row < gridDensity.rows; row++) {
+    const rowPoints = allGridPoints[row];
+    ctx.beginPath();
+    ctx.moveTo(rowPoints[0].x, rowPoints[0].y);
+    for (let col = 1; col < rowPoints.length; col++) {
+      ctx.lineTo(rowPoints[col].x, rowPoints[col].y);
+    }
+    ctx.stroke();
+  }
+
+  // Draw vertical grid lines
+  for (let col = 0; col < gridDensity.cols; col++) {
+    ctx.beginPath();
+    ctx.moveTo(allGridPoints[0][col].x, allGridPoints[0][col].y);
+    for (let row = 1; row < gridDensity.rows; row++) {
+      ctx.lineTo(allGridPoints[row][col].x, allGridPoints[row][col].y);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawCalibration(
+  cs: CanvasState,
+  innerPoints?: GridPoint[][],
+  gridDensity?: { rows: number; cols: number },
+): void {
   const {
     ctx,
     points,
@@ -374,7 +598,20 @@ function drawCalibration(cs: CanvasState): void {
       drawChevron({ x: width, y: height * 0.5 }, Math.PI);
     }
     ctx.stroke();
-    drawGrid(cs, 0);
+
+    // Draw enhanced grid with proper intersections
+    if (innerPoints && gridDensity) {
+      const gridCorners = pointsToGridPoints(points);
+      drawEnhancedGrid(
+        ctx,
+        gridCorners,
+        innerPoints,
+        gridDensity,
+        cs.displaySettings,
+      );
+    } else {
+      drawGrid(cs, 0);
+    }
   }
 
   drawCalibrationPoints(cs);
